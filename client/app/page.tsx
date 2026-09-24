@@ -8,7 +8,7 @@ const SCAN_TRIGGER_PHRASES = ["scan this", "scan it", "capture this", "take a pi
 const NEW_SESSION_PHRASES = ["change the session", "start a new session", "new session", "reset session", "start over", "restart session","restart","restart the session"];
 const STOP_PHRASES = ["stop", "stop talking", "be quiet", "shut up", "pause"];
 const FILLER_MESSAGE = "Processing... please wait a little.";
-const TTS_RATE = 1.35; // faster speech
+const TTS_RATE = 1.15; // faster speech
 const TTS_PITCH = 1.1;
 
 // Words in the filler cue. Used to recognise the phone's mic hearing the
