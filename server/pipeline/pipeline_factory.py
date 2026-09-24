@@ -68,17 +68,27 @@ def build_pipeline(settings: Settings) -> RAGPipeline:
 
     router = AdaptiveRouter(confidence_threshold=settings.adarag_confidence_threshold)
 
-    llm_provider = LLMFactory.create(
-        settings.llm_type,
-        api_key=settings.gemini_api_key,
-        model_name=settings.gemini_model_name,
+    text_llm_provider = LLMFactory.create(
+        settings.text_llm_type,              # e.g. "qwen"
+        api_key=settings.text_llm_api_key,
+        model_name=settings.text_llm_model_name,
         temperature=settings.llm_temperature,
         max_output_tokens=settings.llm_max_output_tokens,
     )
-    generator = ResponseGenerator(llm_provider, PromptBuilder())
+    vision_llm_provider = LLMFactory.create(
+        settings.vision_llm_type,            # e.g. "gemini"
+        api_key=settings.vision_llm_api_key,
+        model_name=settings.vision_llm_model_name,
+        temperature=settings.llm_temperature,
+        max_output_tokens=settings.llm_max_output_tokens,
+    )
+    generator = ResponseGenerator(text_llm_provider, vision_llm_provider, PromptBuilder())
 
     session_store = InMemorySessionStore(max_turns=settings.max_history_turns)
-    query_contextualizer = QueryContextualizer(llm_provider)
+    # Follow-up rewriting is always text-only, even when the original turn had
+    # an image (see QueryContextualizer.contextualize's `has_text and not has_image` gate
+    # in _resolve_query), so it should always use the text model.
+    query_contextualizer = QueryContextualizer(text_llm_provider)
 
     return RAGPipeline(
         light_retriever=light_retriever,

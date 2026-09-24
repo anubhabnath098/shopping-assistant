@@ -1,11 +1,12 @@
 from typing import Dict, Type
 from core.interfaces.llm_provider import BaseLLMProvider
 from llms.gemini_llm import GeminiLLMProvider
-
+from llms.groq_llm import GroqLLMProvider
 
 class LLMFactory:
     _registry: Dict[str, Type[BaseLLMProvider]] = {
         "gemini": GeminiLLMProvider,
+        "groq": GroqLLMProvider,
     }
 
     @classmethod

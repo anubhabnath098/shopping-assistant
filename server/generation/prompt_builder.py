@@ -4,7 +4,13 @@ from core.models.schemas import RetrievedChunk, ConversationTurn, MultiModalQuer
 
 class PromptBuilder:
     """Builds the final grounded prompt sent to the LLM."""
-
+    IMAGE_NOTE = (
+        "IMAGE NOTE: Turns marked '(shared an image)' involved a photo from the customer. "
+        "You cannot see photos from earlier turns. Rely on the assistant's earlier reply that "
+        "describes the photo, and treat the product it identified as the one being discussed "
+        "when the customer says 'it', 'this' or 'that'. If the customer asks about a detail "
+        "of the photo that the earlier reply did not cover, ask them to send the photo again.\n\n"
+    )
     def build(
         self,
         query: MultiModalQuery,
@@ -13,6 +19,7 @@ class PromptBuilder:
     ) -> str:
         history = history or []
         history_block = self._build_history_block(history)
+        image_note = self.IMAGE_NOTE if any(t.query_image_path for t in history) else ""
         context_block = self._build_context_block(retrieved_chunks)
 
         if query.has_text:
@@ -65,6 +72,7 @@ class PromptBuilder:
             "13. Never say 'According to the provided context' or 'Based on the retrieved data'.\n"
             "14. Do not use excessive emojis.\n\n"
 
+            f"{image_note}"
             "CONVERSATION HISTORY:\n"
             f"{history_block}\n\n"
 
@@ -99,6 +107,7 @@ class PromptBuilder:
             return "No previous conversation."
         lines = []
         for turn in history:
-            lines.append(f"User: {turn.query_text}")
+            who = "User (shared an image)" if turn.query_image_path else "User"
+            lines.append(f"{who}: {turn.query_text}")
             lines.append(f"Assistant: {turn.answer}")
         return "\n".join(lines)

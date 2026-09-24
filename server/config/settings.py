@@ -31,11 +31,23 @@ class Settings:
     vector_index_type: str = "hnsw"  # fast ANN, used for both light & heavy paths
 
     # --- LLM ---
-    llm_type: str = "gemini"
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
     gemini_model_name: str = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_model_name: str = os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-20b")
     llm_temperature: float = 0.3
     llm_max_output_tokens: int = 1024
+    llm_type: str = "groq"
+    llm_api_key: str = groq_api_key
+    llm_model_name: str = groq_model_name
+
+    text_llm_type: str = "groq"
+    text_llm_api_key: str = groq_api_key
+    text_llm_model_name: str = groq_model_name
+
+    vision_llm_type: str = "gemini"
+    vision_llm_api_key: str = gemini_api_key
+    vision_llm_model_name: str = gemini_model_name
 
     # --- Chunking ---
     chunk_size_words: int = 200

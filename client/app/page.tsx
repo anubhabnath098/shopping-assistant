@@ -4,20 +4,46 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 // ---- Configuration ----
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL;
+
 const SCAN_TRIGGER_PHRASES = ["scan this", "scan it", "capture this", "take a picture", "click a picture", "scan", "capture", "click", "see this", "see", "look at this", "look"];
-const NEW_SESSION_PHRASES = ["change the session", "start a new session", "new session", "reset session", "start over", "restart session","restart","restart the session"];
+const NEW_SESSION_PHRASES = ["change the session", "start a new session", "new session", "reset session", "start over", "restart session", "restart", "restart the session"];
 const STOP_PHRASES = ["stop", "stop talking", "be quiet", "shut up", "pause"];
+// Lets the user replay the image result later if they declined the first offer.
+const REPLAY_IMAGE_PHRASES = ["read the product details", "read product details", "read the details", "read the image result"];
+
 const FILLER_MESSAGE = "Processing... please wait a little.";
+const IMAGE_OFFER_MESSAGE = "Product details have been fetched. Would you like me to read it?";
+// The text LLM is fast, so the filler cue is only spoken for image requests.
+// Set to true to also speak it for text requests.
+const FILLER_FOR_TEXT = false;
+
+const YES_REGEX = /\b(yes|yeah|yep|yup|sure|ok|okay|please|go ahead|read it|read)\b/i;
+const NO_REGEX = /\b(no|nope|nah|not now|don't|do not|skip|later|cancel|never mind)\b/i;
+
 const TTS_RATE = 1.15; // faster speech
 const TTS_PITCH = 1.1;
 
-// Words in the filler cue. Used to recognise the phone's mic hearing the
-// filler cue through its own speaker (echo) so it isn't sent as a query.
-const FILLER_WORDS = new Set(
-  FILLER_MESSAGE.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean)
-);
+// Words in the assistant's own cues. Used to recognise the mic hearing the
+// cue through its own speaker (echo) so it isn't treated as a query / answer.
+const wordsOf = (s: string) => s.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean);
+const ECHO_WORDS = new Set([...wordsOf(FILLER_MESSAGE), ...wordsOf(IMAGE_OFFER_MESSAGE)]);
 
 type ClientState = "idle" | "listening" | "capturing" | "processing" | "speaking" | "error";
+type RequestKind = "text" | "image";
+type SpeechKind = "text" | "image" | "offer" | "system";
+
+interface RequestMeta {
+  kind: RequestKind;
+  epoch: number; // session epoch the request was sent in (bumped on "new session")
+  discarded: boolean; // true = don't display / speak the answer when it arrives
+}
+
+// A reading that the user paused by tapping the right half of the camera.
+interface PausedSpeech {
+  text: string;
+  kind: SpeechKind;
+  index: number; // chunk that was being spoken when paused
+}
 
 // ---- Helpers (no React state, safe to call from anywhere on the client) ----
 function isMobileDevice(): boolean {
@@ -30,9 +56,9 @@ function isMobileDevice(): boolean {
   );
 }
 
-function isFillerEcho(text: string): boolean {
-  const words = text.toLowerCase().replace(/[^a-z\s]/g, " ").split(/\s+/).filter(Boolean);
-  return words.length > 0 && words.every((w) => FILLER_WORDS.has(w));
+function isEcho(text: string): boolean {
+  const words = wordsOf(text);
+  return words.length > 0 && words.every((w) => ECHO_WORDS.has(w));
 }
 
 // Mobile (and long-utterance) TTS is much more reliable with short chunks:
@@ -66,17 +92,27 @@ function splitIntoChunks(text: string, maxLen = 180): string[] {
 export default function VoiceClientPage() {
   const [state, setState] = useState<ClientState>("idle");
   const [transcript, setTranscript] = useState("");
-  const [answer, setAnswer] = useState("");
+  const [textAnswer, setTextAnswer] = useState("");
+  const [imageAnswer, setImageAnswer] = useState("");
+  const [imageBusy, setImageBusy] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [speechPaused, setSpeechPaused] = useState(false); // UI only: a reading is paused via the right half of the camera
   // Mobile browsers only allow the mic + speech synthesis after a user tap,
   // so nothing voice-related starts until the user presses "Tap to start".
   const [started, setStarted] = useState(false);
 
+  // IMPORTANT: startRecognition is memoized once (useCallback with []), so every
+  // function it can reach (handleFinalTranscript, handleStopCommand, ...) is the
+  // FIRST render's closure. They must therefore only read REFS, never React
+  // state values. State setters are fine.
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const recognitionRef = useRef<any>(null);
-  const isSpeakingRef = useRef(false); // true ONLY while the real final answer is being spoken
+  const isSpeakingRef = useRef(false); // true ONLY while a real answer / offer is being spoken (mic = stop-only)
+  const speakingKindRef = useRef<SpeechKind | null>(null);
   const micEnabledRef = useRef(false); // mic is meant to be on (set true once the user taps start)
   const startedRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
@@ -88,7 +124,7 @@ export default function VoiceClientPage() {
   const isRecognitionActiveRef = useRef(false);
   const restartTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRecognitionErrorRef = useRef<string | null>(null);
-  // On phones the mic is paused while the final answer is spoken, so the
+  // On phones the mic is paused while an answer is spoken, so the
   // phone's speaker isn't picked up by its own microphone.
   const recognitionPausedRef = useRef(false);
   // Guards against Android re-firing the same final result twice.
@@ -99,24 +135,89 @@ export default function VoiceClientPage() {
   const speechTokenRef = useRef(0);
   const speechWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null); // keep a reference so Chrome doesn't garbage-collect it mid-speech
-  const fillerEchoUntilRef = useRef(0); // until this time, filler-cue echo is ignored
+  const echoUntilRef = useRef(0); // until this time, echo of our own cues is ignored
+  const noticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ---- Request correlation (no request_id from the backend, so we infer it) ----
-  // The server processes one full request/response cycle (status -> tokens ->
-  // final) per incoming message before reading the next one, so responses
-  // arrive in the same order requests were sent. We track that order
-  // ourselves and only ever display/speak the response matching the LATEST
-  // request the user actually asked for — anything older is discarded.
+  // The item currently being spoken, so it can be paused and resumed.
+  const activeSpeechRef = useRef<{ text: string; kind: SpeechKind; chunks: string[]; index: number } | null>(null);
+  // Set while the user has paused the reading (right half of the camera).
+  const pausedSpeechRef = useRef<PausedSpeech | null>(null);
+
+  // ---- Request tracking (server echoes request_id + kind on every message) ----
   const requestSeqRef = useRef(0);
-  const pendingRequestQueueRef = useRef<number[]>([]); // FIFO of dispatched request ids awaiting their "final"
-  const latestRequestIdRef = useRef<number | null>(null); // id we still care about; null = don't care about any pending answer
+  const requestsRef = useRef<Map<string, RequestMeta>>(new Map());
+  // Locks: at most ONE text request and ONE image request in flight at a time.
+  const textRequestIdRef = useRef<string | null>(null);
+  const imageRequestIdRef = useRef<string | null>(null);
+  // Bumped on "new session" so answers from the old session are dropped.
+  const sessionEpochRef = useRef(0);
 
-  useEffect(() => {
-    sessionIdRef.current = sessionId;
-  }, [sessionId]);
+  // ---- Image result hand-off ----
+  const imageAnswerRef = useRef(""); // latest image answer (for reading / replay)
+  const imageOfferDueRef = useRef(false); // an image result is waiting to be offered
+  const offerActiveRef = useRef(false); // "would you like me to read it?" asked, awaiting yes/no
 
-  function isRequestStillRelevant(requestId: number | undefined): boolean {
-    return requestId !== undefined && latestRequestIdRef.current !== null && requestId === latestRequestIdRef.current;
+  // ---------- UI helpers ----------
+  function showNotice(msg: string) {
+    setNotice(msg);
+    if (noticeTimeoutRef.current) clearTimeout(noticeTimeoutRef.current);
+    noticeTimeoutRef.current = setTimeout(() => setNotice(null), 4000);
+  }
+
+  function updateSession(id: string) {
+    sessionIdRef.current = id;
+    setSessionId(id);
+  }
+
+  // Derives the main status from refs. The image request never affects it:
+  // while only an image is in flight the user is free to keep talking.
+  function refreshIdleState() {
+    if (!startedRef.current) return;
+    if (isSpeakingRef.current) setState("speaking");
+    else if (textRequestIdRef.current) setState("processing");
+    else setState("listening");
+  }
+
+  // ---------- Camera halves: LEFT = stop, RIGHT = pause / resume ----------
+  function setPausedSpeech(p: PausedSpeech | null) {
+    pausedSpeechRef.current = p;
+    setSpeechPaused(!!p);
+  }
+
+  // Left half of the camera: same as saying "stop".
+  function handleStopTap() {
+    if (!startedRef.current) return;
+    handleStopCommand();
+  }
+
+  // Right half of the camera: reading -> pause + listen, paused -> resume where it left off.
+  function handlePauseTap() {
+    if (!startedRef.current) return;
+    if (isSpeakingRef.current) {
+      pauseSpeech();
+    } else if (pausedSpeechRef.current) {
+      resumeSpeech();
+    }
+  }
+
+  function pauseSpeech() {
+    const s = activeSpeechRef.current;
+    if (!s) return;
+    // Remember where we were BEFORE cancelSpeech() clears the active speech.
+    setPausedSpeech({ text: s.text, kind: s.kind, index: s.index });
+    cancelSpeech();
+    isSpeakingRef.current = false;
+    refreshIdleState(); // -> "listening" (or "processing" if a text request is in flight)
+    // Phones: the mic was paused while speaking, bring it back now.
+    if (recognitionPausedRef.current) resumeRecognition();
+  }
+
+  function resumeSpeech() {
+    const p = pausedSpeechRef.current;
+    if (!p) return;
+    // Re-speak from the start of the sentence that was playing.
+    // (speakText clears the paused state.)
+    speakText(p.text, p.kind, p.index);
   }
 
   // ---------- 1. Camera: always-on preview ----------
@@ -154,17 +255,26 @@ export default function VoiceClientPage() {
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       const msg = JSON.parse(event.data);
       handleServerMessage(msg);
     };
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) return;
       setErrorMessage("WebSocket connection error.");
       setState("error");
     };
 
     ws.onclose = () => {
+      if (wsRef.current !== ws) return;
       console.log("WebSocket closed");
+      // Nothing in flight can ever return now — release the locks so the UI isn't stuck.
+      requestsRef.current.clear();
+      textRequestIdRef.current = null;
+      imageRequestIdRef.current = null;
+      setImageBusy(false);
+      setErrorMessage("Connection lost. Reload the page to reconnect.");
     };
 
     return () => {
@@ -174,56 +284,143 @@ export default function VoiceClientPage() {
   }, []);
 
   function handleServerMessage(msg: any) {
+    const requestId: string | undefined = msg.request_id;
+    const meta = requestId ? requestsRef.current.get(requestId) : undefined;
+    // Only trust session ids coming from requests of the CURRENT session,
+    // otherwise a late reply from an old session would revert a "new session".
+    const sameEpoch = !!meta && meta.epoch === sessionEpochRef.current;
+
     switch (msg.type) {
       case "session":
-        setSessionId(msg.session_id);
+        updateSession(msg.session_id);
         break;
 
-      case "status": {
-        // Only reflect status in the UI if it belongs to the request we still care about.
-        const frontId = pendingRequestQueueRef.current[0];
-        if (isRequestStillRelevant(frontId)) {
-          setState("processing");
-        }
+      case "accepted":
+        if (sameEpoch && msg.session_id) updateSession(msg.session_id);
         break;
-      }
 
-      case "token": {
-        const frontId = pendingRequestQueueRef.current[0];
-        if (isRequestStillRelevant(frontId)) {
-          setAnswer((prev) => prev + msg.text);
-        }
-        // else: tokens belong to a superseded request — silently discard
+      case "status":
+        // Nothing to do: the busy state is driven by our own request locks.
         break;
-      }
+
+      case "token":
+        // Only text requests stream tokens to the UI (server suppresses image tokens anyway).
+        if (
+          meta &&
+          meta.kind === "text" &&
+          !meta.discarded &&
+          requestId === textRequestIdRef.current
+        ) {
+          setTextAnswer((prev) => prev + msg.text);
+        }
+        break;
 
       case "final": {
-        const finishedId = pendingRequestQueueRef.current.shift();
-        setSessionId(msg.session_id);
+        if (!meta || !requestId) break;
+        requestsRef.current.delete(requestId);
+        if (sameEpoch && msg.session_id) updateSession(msg.session_id);
 
-        if (isRequestStillRelevant(finishedId)) {
-          // Overwrite with the authoritative full text (covers any dropped tokens)
-          setAnswer(msg.answer);
-          speakFinalAnswer(msg.answer);
+        if (meta.kind === "text") {
+          onTextFinal(msg.answer, meta.discarded);
         } else {
-          // Stale response — the user already asked something else. Discard
-          // it entirely: don't display it, don't speak it. If the request we
-          // DO care about is still pending, stay in "processing".
-          if (pendingRequestQueueRef.current.length > 0) {
-            setState("processing");
-          }
+          onImageFinal(msg.answer, meta.discarded);
         }
         break;
       }
 
-      case "error":
+      case "error": {
         setErrorMessage(msg.message);
-        setState("error");
+        if (meta && requestId) {
+          requestsRef.current.delete(requestId);
+          if (meta.kind === "text") {
+            textRequestIdRef.current = null;
+          } else {
+            imageRequestIdRef.current = null;
+            setImageBusy(false);
+          }
+          refreshIdleState();
+          maybeOfferImageResult();
+        }
         break;
+      }
 
       default:
         break;
     }
+  }
+
+  function onTextFinal(answer: string | undefined, discarded: boolean) {
+    textRequestIdRef.current = null; // text lock released — next text question is allowed
+
+    if (discarded) {
+      // User said "stop" (or started a new session) while it was processing.
+      refreshIdleState();
+      maybeOfferImageResult();
+      return;
+    }
+
+    // Overwrite with the authoritative full text (covers any dropped tokens)
+    setTextAnswer(answer || "");
+    speakText(answer || "", "text"); // when finished -> maybeOfferImageResult()
+  }
+
+  function onImageFinal(answer: string | undefined, discarded: boolean) {
+    imageRequestIdRef.current = null; // image lock released — next scan is allowed
+    setImageBusy(false);
+
+    if (discarded) return; // belonged to an old session
+
+    setImageAnswer(answer || "");
+    imageAnswerRef.current = answer || "";
+
+    if (!answer) {
+      showNotice("The image request returned no details.");
+      return;
+    }
+
+    // Always ask before reading it. If a text conversation is still going on
+    // (request in flight or answer being spoken) the offer is deferred until
+    // that turn is over — it is triggered again from onSpeechFinished /
+    // onTextFinal / handleStopCommand.
+    imageOfferDueRef.current = true;
+    maybeOfferImageResult();
+  }
+
+  // ---------- Offering the image result ----------
+  function maybeOfferImageResult() {
+    if (!imageOfferDueRef.current || !imageAnswerRef.current) return;
+    if (!startedRef.current || !micEnabledRef.current) return;
+    if (textRequestIdRef.current) return; // text turn still in flight
+    if (isSpeakingRef.current) return; // something is being spoken
+    if (pausedSpeechRef.current) return; // a paused reading is still unfinished
+    if (offerActiveRef.current) return; // already asked
+
+    imageOfferDueRef.current = false;
+    offerActiveRef.current = true; // the next thing the user says is the answer
+    speakText(IMAGE_OFFER_MESSAGE, "offer");
+  }
+
+  function readImageAnswer() {
+    const answer = imageAnswerRef.current;
+    if (!answer) {
+      showNotice("There is no image result to read yet.");
+      return;
+    }
+    if (textRequestIdRef.current) {
+      showNotice("Wait for the current answer to finish first.");
+      return;
+    }
+    imageOfferDueRef.current = false;
+    offerActiveRef.current = false;
+    speakText(answer, "image");
+  }
+
+  // Called whenever a spoken item finishes on its own (not when cancelled).
+  function onSpeechFinished(kind: SpeechKind) {
+    if (kind === "offer") return; // now waiting for the user's yes / no
+    // A text answer (or anything else) is done -> the text conversation is idle,
+    // so a waiting image result can be offered now.
+    maybeOfferImageResult();
   }
 
   // ---------- 3. Pick a female voice for TTS once voices are loaded ----------
@@ -273,7 +470,9 @@ export default function VoiceClientPage() {
   function cancelSpeech() {
     speechTokenRef.current += 1;
     clearSpeechWatchdog();
-    fillerEchoUntilRef.current = 0;
+    echoUntilRef.current = 0;
+    speakingKindRef.current = null;
+    activeSpeechRef.current = null;
     window.speechSynthesis.cancel();
   }
 
@@ -316,19 +515,19 @@ export default function VoiceClientPage() {
 
   // ---------- 4. Speech recognition: continuous listening ----------
   // Recognition is kept ALIVE at all times so it is always ready for the next
-  // query. On desktop it also stays on while the assistant speaks the final
-  // answer, so a spoken "stop" can interrupt it; while isSpeakingRef is true
-  // every transcript except "stop" is ignored so the mic picking up the
-  // assistant's own voice can't misfire as a new query.
+  // query. On desktop it also stays on while the assistant speaks, so a spoken
+  // "stop" can interrupt it; while isSpeakingRef is true every transcript
+  // except "stop" is ignored so the mic picking up the assistant's own voice
+  // can't misfire as a new query.
   //
-  // On phones the mic is paused while the final answer is spoken (the speaker
-  // is right next to the mic, so it hears itself, and Android also mutes or
-  // cuts off TTS while recognition is running). The on-screen Stop button
-  // replaces the voice "stop" there.
+  // On phones the mic is paused while an answer is spoken (the speaker is right
+  // next to the mic, and Android also mutes or cuts off TTS while recognition
+  // is running). The left / right halves of the camera replace the voice "stop"
+  // there.
   //
-  // During "processing" (including while the short filler cue plays)
-  // isSpeakingRef stays false, so normal queries are accepted immediately —
-  // this is what lets the user interrupt/replace an in-flight request.
+  // During "processing" and while an IMAGE is being analysed, isSpeakingRef
+  // stays false, so the mic accepts normal input (subject to the one-text /
+  // one-image locks).
   const startRecognition = useCallback(() => {
     if (restartTimeoutRef.current) {
       clearTimeout(restartTimeoutRef.current);
@@ -385,7 +584,7 @@ export default function VoiceClientPage() {
       const cleanedFinal = final.trim().toLowerCase();
       const saidStop = cleanedFinal && STOP_PHRASES.some((phrase) => cleanedFinal.includes(phrase));
 
-      // While the real final answer is playing, only react to "stop" —
+      // While an answer / the image offer is playing, only react to "stop" —
       // everything else (including likely echo of the assistant's own
       // voice) is ignored so it can't be misread as a new query.
       if (isSpeakingRef.current) {
@@ -397,9 +596,10 @@ export default function VoiceClientPage() {
 
       const heard = (interim || final).trim();
 
-      // The phone's mic can hear the "Processing... please wait" cue coming out
-      // of its own speaker. Ignore that echo so it doesn't replace the real query.
-      if (heard && Date.now() < fillerEchoUntilRef.current && isFillerEcho(heard)) {
+      // The mic can hear the filler cue / the "would you like me to read it?"
+      // prompt coming out of the speaker. Ignore that echo so it isn't taken
+      // as a query or as a "yes".
+      if (heard && Date.now() < echoUntilRef.current && isEcho(heard)) {
         return;
       }
 
@@ -413,7 +613,7 @@ export default function VoiceClientPage() {
         }
         lastFinalRef.current = { text: cleanedFinal, time: now };
 
-        handleFinalTranscript(final.trim(), saidStop);
+        handleFinalTranscript(final.trim(), !!saidStop);
       }
     };
 
@@ -497,6 +697,7 @@ export default function VoiceClientPage() {
     return () => {
       micEnabledRef.current = false;
       if (restartTimeoutRef.current) clearTimeout(restartTimeoutRef.current);
+      if (noticeTimeoutRef.current) clearTimeout(noticeTimeoutRef.current);
       clearSpeechWatchdog();
       try {
         recognitionRef.current?.stop();
@@ -533,25 +734,47 @@ export default function VoiceClientPage() {
       return;
     }
 
-    // Keep what the user said on screen (it used to be cleared in the same
-    // instant it was set, so on phones — which often deliver only a final
-    // result and no interim ones — it was never visible).
+    // Keep what the user said on screen.
     setTranscript(text);
 
     const lowerText = text.toLowerCase();
 
+    // (a) Answer to "Product details have been fetched. Would you like me to read it?"
+    //     "yes" -> read the image result. Anything else -> offer declined, and
+    //     the utterance carries on as a normal one (unless it was a plain "no").
+    if (offerActiveRef.current) {
+      offerActiveRef.current = false;
+      if (NO_REGEX.test(lowerText)) {
+        refreshIdleState();
+        return;
+      }
+      if (YES_REGEX.test(lowerText)) {
+        readImageAnswer();
+        return;
+      }
+      // not a yes/no -> fall through and treat it as a normal query
+    }
+
+    // (b) Replay of an earlier image result the user declined.
+    if (REPLAY_IMAGE_PHRASES.some((p) => lowerText.includes(p))) {
+      readImageAnswer();
+      return;
+    }
+
+    // (c) New session
     const matchedNewSession = NEW_SESSION_PHRASES.find((phrase) => lowerText.includes(phrase));
     if (matchedNewSession) {
       startNewSession();
       return;
     }
 
+    // (d) Image query or (e) plain text query
     const matchedScanTrigger = SCAN_TRIGGER_PHRASES.find((phrase) => lowerText.includes(phrase));
     if (matchedScanTrigger) {
       const remainingText = lowerText.replace(matchedScanTrigger, "").trim();
       captureFrameAndSend(remainingText || null);
     } else {
-      sendQuery(text, null);
+      sendTextQuery(text);
     }
   }
 
@@ -570,56 +793,88 @@ export default function VoiceClientPage() {
   }
 
   function captureFrameAndSend(text: string | null) {
+    // Only one image at a time — wait until the previous image response returns.
+    if (imageRequestIdRef.current) {
+      showNotice("Still processing the previous image. You can keep asking questions meanwhile.");
+      return;
+    }
+
     setState("capturing");
     const imageBase64 = captureFrame();
     if (!imageBase64) {
       setErrorMessage("Could not capture a frame from the camera.");
-      setState("error");
+      refreshIdleState();
       return;
     }
-    sendQuery(text, imageBase64);
+    dispatchRequest("image", text, imageBase64);
   }
 
-  // ---------- 7. Send query over WebSocket ----------
-  function sendQuery(text: string | null, imageBase64: string | null) {
+  function sendTextQuery(text: string) {
+    // Only one text question at a time — wait until its answer has come back.
+    if (textRequestIdRef.current) {
+      showNotice("Still answering your previous question. Please wait for it to finish.");
+      return;
+    }
+    dispatchRequest("text", text, null);
+  }
+
+  // ---------- 7. Send a request over WebSocket ----------
+  function dispatchRequest(kind: RequestKind, text: string | null, imageBase64: string | null) {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       setErrorMessage("WebSocket is not connected.");
-      setState("error");
+      refreshIdleState();
       return;
     }
 
-    // A new query always supersedes whatever the assistant was doing/saying —
-    // cut off any current speech (filler or a previous final answer) immediately.
+    // A new query supersedes any filler cue that may still be playing.
     cancelSpeech();
     isSpeakingRef.current = false;
+    setErrorMessage(null);
 
-    const requestId = ++requestSeqRef.current;
-    pendingRequestQueueRef.current.push(requestId);
-    latestRequestIdRef.current = requestId;
+    const requestId = `${kind}-${++requestSeqRef.current}-${Date.now().toString(36)}`;
+    requestsRef.current.set(requestId, {
+      kind,
+      epoch: sessionEpochRef.current,
+      discarded: false,
+    });
 
-    setAnswer(""); // discard whatever was shown for a previous, now-superseded request
-    setState("processing");
+    if (kind === "text") {
+      textRequestIdRef.current = requestId;
+      setPausedSpeech(null); // a new question replaces any paused reading
+      setTextAnswer(""); // discard whatever was shown for the previous text answer
+    } else {
+      imageRequestIdRef.current = requestId;
+      setImageBusy(true);
+      setImageAnswer("");
+      imageAnswerRef.current = "";
+      imageOfferDueRef.current = false; // a new scan replaces any unread old result
+    }
 
     ws.send(
       JSON.stringify({
+        request_id: requestId,
         session_id: sessionIdRef.current,
         text: text,
         image_base64: imageBase64,
       })
     );
 
-    speakFillerCue();
+    refreshIdleState(); // -> "processing" only when a TEXT request is in flight
+
+    if (kind === "image" || FILLER_FOR_TEXT) {
+      speakFillerCue();
+    }
   }
 
   // ---------- 8a. Filler cue while a request is in flight (does NOT gate the mic) ----------
   function speakFillerCue() {
     const token = speechTokenRef.current;
-    fillerEchoUntilRef.current = Date.now() + 6000;
+    echoUntilRef.current = Date.now() + 6000;
 
-    // Deliberately do NOT set isSpeakingRef here — the mic must keep
-    // listening normally (not stop-only) while this plays and while the
-    // request is processing, so the user can ask something else right away.
+    // Deliberately do NOT set isSpeakingRef here — the mic must keep listening
+    // normally (not stop-only) while this plays, so the user can ask something
+    // else right away.
     //
     // The short delay after cancel() matters: on Chrome/Android, speak()
     // called in the same tick as cancel() is frequently dropped.
@@ -628,36 +883,53 @@ export default function VoiceClientPage() {
       const utterance = makeUtterance(FILLER_MESSAGE);
       utteranceRef.current = utterance;
       utterance.onend = () => {
-        fillerEchoUntilRef.current = Date.now() + 1200; // tail of the echo
+        echoUntilRef.current = Date.now() + 1200; // tail of the echo
       };
       window.speechSynthesis.speak(utterance);
     }, 120);
   }
 
-  // ---------- 8b. Text-to-speech playback of the REAL final answer (gates the mic to stop-only) ----------
-  function speakFinalAnswer(text: string) {
-    if (!text) {
-      setState("listening");
+  // ---------- 8b. Speak a real item (text answer / image answer / image offer / system msg) ----------
+  // Gates the mic to stop-only while playing. When it finishes on its own,
+  // onSpeechFinished(kind) decides what happens next.
+  // startIndex lets a paused reading resume from the sentence it was on.
+  function speakText(text: string, kind: SpeechKind, startIndex = 0) {
+    setPausedSpeech(null); // any new speech replaces a paused one
+
+    if (!text || !text.trim()) {
+      cancelSpeech();
+      isSpeakingRef.current = false;
+      refreshIdleState();
+      onSpeechFinished(kind);
       return;
     }
 
     cancelSpeech(); // clear the filler cue or any leftover speech
     const token = speechTokenRef.current;
     isSpeakingRef.current = true;
+    speakingKindRef.current = kind;
     setState("speaking");
 
     const mobile = isMobileDevice();
     if (mobile) pauseRecognition();
 
     const chunks = splitIntoChunks(text);
-    let index = 0;
+    let index = Math.min(Math.max(startIndex, 0), Math.max(chunks.length - 1, 0));
+    // Tracks the chunk currently being spoken so pauseSpeech() knows where to resume.
+    const session = { text, kind, chunks, index };
+    activeSpeechRef.current = session;
 
     const finish = () => {
       if (token !== speechTokenRef.current) return;
       clearSpeechWatchdog();
       isSpeakingRef.current = false;
-      setState("listening");
+      speakingKindRef.current = null;
+      activeSpeechRef.current = null;
+      // The mic may still "hear" the tail of the prompt — don't let it count as a yes.
+      if (kind === "offer") echoUntilRef.current = Date.now() + 2000;
+      refreshIdleState();
       if (mobile) resumeRecognition();
+      onSpeechFinished(kind);
     };
 
     const speakNext = () => {
@@ -668,6 +940,7 @@ export default function VoiceClientPage() {
         return;
       }
 
+      session.index = index; // the chunk about to be spoken
       const chunk = chunks[index++];
       const utterance = makeUtterance(chunk);
       utteranceRef.current = utterance;
@@ -703,39 +976,154 @@ export default function VoiceClientPage() {
     setTimeout(speakNext, 120);
   }
 
-  // ---------- 9. "Stop" — never sent to backend; halts speech and invalidates any pending answer ----------
-  // Triggered by voice ("stop") or by the on-screen Stop button.
+  // ---------- 9. "Stop" — never sent to backend ----------
+  // Triggered by voice ("stop") or by tapping the LEFT half of the camera.
+  // Stops speech and drops the pending TEXT answer. It does NOT touch the
+  // image request: that keeps processing and its result is still offered.
+  // Unlike the pause (right half), Stop also discards a paused reading (no resume).
   function handleStopCommand() {
     cancelSpeech();
     isSpeakingRef.current = false;
     setTranscript("");
-    // Whatever request(s) are still in flight, we no longer care about their
-    // answers — when their "final" eventually arrives it will be discarded.
-    latestRequestIdRef.current = null;
-    setState("listening");
+    setPausedSpeech(null);
+
+    // Stopping while the "read it?" prompt is playing / awaiting = "no thanks".
+    offerActiveRef.current = false;
+
+    // If a text request is still in flight, we no longer want its answer.
+    // (The text lock stays until it returns, so two text requests never overlap.)
+    const textId = textRequestIdRef.current;
+    if (textId) {
+      const meta = requestsRef.current.get(textId);
+      if (meta) meta.discarded = true;
+    }
+
+    refreshIdleState();
     if (recognitionPausedRef.current) {
       resumeRecognition(); // phones: bring the mic back
     }
+
+    // Even after a stopped text answer, a waiting image result must still be offered.
+    maybeOfferImageResult();
   }
 
   // ---------- 10. Voice-triggered new session ----------
   function startNewSession() {
-    setSessionId(null);
+    sessionEpochRef.current += 1;
+    updateSession("");
     sessionIdRef.current = null;
-    setAnswer("");
+    setSessionId(null);
+    setTextAnswer("");
+    setImageAnswer("");
+    imageAnswerRef.current = "";
+    imageOfferDueRef.current = false;
+    offerActiveRef.current = false;
+    setPausedSpeech(null);
     setTranscript("");
-    latestRequestIdRef.current = null; // discard any answer still in flight from the old session
+
+    // Answers still in flight belong to the old session -> drop them when they
+    // arrive. (Locks are released only when those replies actually return.)
+    requestsRef.current.forEach((meta) => {
+      meta.discarded = true;
+    });
+
     cancelSpeech();
     isSpeakingRef.current = false;
-    speakFinalAnswer("Starting a new session.");
+    speakText("Starting a new session.", "system");
   }
+
+  // Shared style for the two tap zones on top of the camera.
+  const halfStyle: React.CSSProperties = {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: "50%",
+    display: "flex",
+    alignItems: "flex-end",
+    justifyContent: "center",
+    paddingBottom: 10,
+    cursor: started ? "pointer" : "default",
+    userSelect: "none",
+    WebkitUserSelect: "none",
+    WebkitTapHighlightColor: "transparent",
+    touchAction: "manipulation",
+  };
+
+  const halfLabelStyle: React.CSSProperties = {
+    padding: "6px 14px",
+    borderRadius: 999,
+    fontSize: 13,
+    fontWeight: 600,
+    color: "#fff",
+    background: "rgba(0,0,0,0.55)",
+    pointerEvents: "none",
+  };
 
   return (
     <div className="container" suppressHydrationWarning>
       <h2>Shopping Assistant</h2>
 
-      <div className="video-wrap" suppressHydrationWarning>
-        <video ref={videoRef} autoPlay playsInline muted />
+      {/* Camera: nearly full width (small side margins), split into two tap halves.
+          LEFT half = stop reading, RIGHT half = pause / resume reading. */}
+      <div
+        className="video-wrap"
+        style={{
+          position: "relative",
+          width: "96vw",
+          maxWidth: "none",
+          marginLeft: "calc(50% - 48vw)",
+          marginRight: 0,
+          borderRadius: 12,
+          overflow: "hidden",
+          background: "#000",
+        }}
+        suppressHydrationWarning
+      >
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          style={{ display: "block", width: "100%", height: "auto" }}
+        />
+
+        {/* LEFT: stop */}
+        <div
+          role="button"
+          aria-label="Stop reading"
+          onClick={handleStopTap}
+          style={{ ...halfStyle, left: 0 }}
+          suppressHydrationWarning
+        >
+          {started && <span style={halfLabelStyle}>⏹ Stop</span>}
+        </div>
+
+        {/* RIGHT: pause / resume */}
+        <div
+          role="button"
+          aria-label={speechPaused ? "Resume reading" : "Pause reading"}
+          onClick={handlePauseTap}
+          style={{ ...halfStyle, right: 0 }}
+          suppressHydrationWarning
+        >
+          {started && (
+            <span style={halfLabelStyle}>{speechPaused ? "▶ Resume" : "⏸ Pause"}</span>
+          )}
+        </div>
+
+        {/* Thin divider between the halves */}
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            bottom: 0,
+            left: "50%",
+            width: 1,
+            background: "rgba(255,255,255,0.35)",
+            pointerEvents: "none",
+          }}
+          suppressHydrationWarning
+        />
       </div>
 
       {!started && (
@@ -762,26 +1150,26 @@ export default function VoiceClientPage() {
       <div className="status-bar" suppressHydrationWarning>
         <span className={`dot ${state}`} suppressHydrationWarning />
         <span suppressHydrationWarning>{state.toUpperCase()}</span>
+        {speechPaused && (
+          <span style={{ marginLeft: 12, fontSize: 13, color: "#6b7280" }} suppressHydrationWarning>
+            ⏸ Reading paused
+          </span>
+        )}
+        {imageBusy && (
+          <span style={{ marginLeft: 12, fontSize: 13, color: "#6b7280" }} suppressHydrationWarning>
+            🖼 Analysing image… (you can keep asking questions)
+          </span>
+        )}
       </div>
 
-      {(state === "speaking" || state === "processing") && (
-        <button
-          onClick={handleStopCommand}
-          style={{
-            padding: "10px 16px",
-            marginBottom: 8,
-            fontSize: 14,
-            fontWeight: 600,
-            borderRadius: 8,
-            border: "1px solid #e74c3c",
-            background: "transparent",
-            color: "#e74c3c",
-            cursor: "pointer",
-          }}
+      {notice && (
+        <div
+          className="panel"
+          style={{ borderColor: "#f59e0b", fontSize: 13 }}
           suppressHydrationWarning
         >
-          ⏹ Stop
-        </button>
+          {notice}
+        </div>
       )}
 
       <div className="panel" suppressHydrationWarning>
@@ -798,8 +1186,36 @@ export default function VoiceClientPage() {
           Assistant answer
         </div>
         <div className="answer-text" suppressHydrationWarning>
-          {answer || "…"}
+          {textAnswer || "…"}
         </div>
+      </div>
+
+      <div className="panel" suppressHydrationWarning>
+        <div className="label" suppressHydrationWarning>
+          Product details (from image)
+        </div>
+        <div className="answer-text" suppressHydrationWarning>
+          {imageAnswer || (imageBusy ? "Analysing…" : "…")}
+        </div>
+        {imageAnswer && state !== "speaking" && (
+          <button
+            onClick={readImageAnswer}
+            style={{
+              marginTop: 8,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 600,
+              borderRadius: 8,
+              border: "1px solid #2563eb",
+              background: "transparent",
+              color: "#2563eb",
+              cursor: "pointer",
+            }}
+            suppressHydrationWarning
+          >
+            🔊 Read product details
+          </button>
+        )}
       </div>
 
       {errorMessage && (
@@ -816,11 +1232,15 @@ export default function VoiceClientPage() {
       </div>
       <p style={{ fontSize: 12, color: "#6b7280", marginTop: 14 }} suppressHydrationWarning>
         Tap <b>Start</b> once, then just speak — the system keeps listening. Say <b>"scan this"</b>{" "}
-        (optionally with a question) to capture the camera frame, <b>"stop"</b> (or tap the Stop
-        button) to interrupt the assistant mid-answer, or <b>"start a new session"</b> to reset the
-        conversation. On phones the microphone pauses while the assistant is speaking, so use the
-        Stop button to interrupt. You can ask a new question at any time while a previous one is
-        still being processed. Use Chrome — SpeechRecognition is not supported in Firefox/Safari.
+        (optionally with a question) to capture the camera frame; the image is analysed in the
+        background while you can keep asking normal questions (one question at a time). When the
+        product details are ready you'll be asked if you want them read out — say <b>"yes"</b> or{" "}
+        <b>"no"</b>. Tap the <b>left half</b> of the camera (or say <b>"stop"</b>) to cancel the
+        reading completely; this never cancels image processing. Tap the <b>right half</b> to
+        pause the reading and start listening, and tap it again to continue from where it
+        stopped. Say <b>"start a new session"</b> to reset the conversation. On phones the
+        microphone pauses while the assistant is speaking, so use the camera halves to interrupt.
+        Use Chrome — SpeechRecognition is not supported in Firefox/Safari.
       </p>
     </div>
   );

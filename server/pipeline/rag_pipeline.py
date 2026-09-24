@@ -142,12 +142,13 @@ class RAGPipeline:
 
     def _resolve_query(self, query: MultiModalQuery, history) -> MultiModalQuery:
         """Rewrites an elliptical follow-up's text using history; the image passes through untouched."""
-        if not query.has_text:
+        if not query.has_text or query.has_image:
             return query
         rewritten_text = self._query_contextualizer.contextualize(query.text, history)
         if rewritten_text == query.text:
             return query
         return MultiModalQuery(session_id=query.session_id, text=rewritten_text, image_path=query.image_path)
+    IMAGE_TAG = "[User attached an image]"
 
     def _save_turn(
         self,
@@ -156,10 +157,16 @@ class RAGPipeline:
         answer_text: str,
         retrieved_chunks: List[RetrievedChunk],
     ) -> None:
+        query_label = resolved_query.text or resolved_query.display_text()
+        # Later text-only turns are answered by a text-only LLM. Tagging the saved
+        # turn tells it that this answer describes an image the user shared.
+        if original_query.has_image and not query_label.startswith(self.IMAGE_TAG):
+            query_label = f"{self.IMAGE_TAG} {query_label}"
+
         self._session_store.add_turn(
             original_query.session_id,
             ConversationTurn(
-                query_text=resolved_query.text or resolved_query.display_text(),
+                query_text=query_label,
                 query_image_path=original_query.image_path,
                 answer=answer_text,
                 retrieved_chunks=retrieved_chunks,
