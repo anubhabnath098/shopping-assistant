@@ -1,26 +1,111 @@
-@import "tailwindcss";
-
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  box-sizing: border-box;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #0f1115;
+  color: #e6e6e6;
+}
+
+.container {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.video-wrap {
+  position: relative;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 2px solid #2a2f3a;
+  background: #000;
+}
+
+video {
+  width: 100%;
+  display: block;
+}
+
+.status-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 14px 0;
+  font-size: 14px;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot.idle { background: #4b7bec; }
+.dot.listening { background: #2ecc71; }
+.dot.capturing { background: #f1c40f; }
+.dot.processing { background: #e67e22; }
+.dot.speaking { background: #9b59b6; }
+.dot.error { background: #e74c3c; }
+
+.panel {
+  background: #161a22;
+  border: 1px solid #2a2f3a;
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 14px;
+}
+
+.label {
+  font-size: 12px;
+  color: #8a92a3;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
+.answer-text {
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.transcript-text {
+  color: #9aa4b2;
+  font-style: italic;
+  min-height: 20px;
+}
+
+.sources {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #8a92a3;
+}
+
+button {
+  background: #2f65f0;
+  color: white;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+button:disabled {
+  background: #3a3f4b;
+  cursor: not-allowed;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.session-id {
+  font-size: 12px;
+  color: #6b7280;
+  margin-top: 8px;
 }
