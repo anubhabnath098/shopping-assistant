@@ -102,6 +102,10 @@ export default function VoiceClientPage() {
   // Mobile browsers only allow the mic + speech synthesis after a user tap,
   // so nothing voice-related starts until the user presses "Tap to start".
   const [started, setStarted] = useState(false);
+  // UI-only: bumped the instant a frame is captured, to play a one-shot
+  // "shutter" animation. Purely cosmetic — nothing reads this except the
+  // overlay markup below, so it can't affect any capture/session logic.
+  const [captureFlashKey, setCaptureFlashKey] = useState(0);
 
   // IMPORTANT: startRecognition is memoized once (useCallback with []), so every
   // function it can reach (handleFinalTranscript, handleStopCommand, ...) is the
@@ -800,6 +804,9 @@ export default function VoiceClientPage() {
     }
 
     setState("capturing");
+    // Fires the one-shot "shutter" animation at the exact moment the frame is
+    // grabbed. Purely cosmetic — does not affect capture/session logic.
+    setCaptureFlashKey((k) => k + 1);
     const imageBase64 = captureFrame();
     if (!imageBase64) {
       setErrorMessage("Could not capture a frame from the camera.");
@@ -1061,6 +1068,19 @@ export default function VoiceClientPage() {
 
   return (
     <div className="container" suppressHydrationWarning>
+      {/* One-shot "shutter" animation, played the instant a frame is captured. */}
+      <style>{`
+        @keyframes captureFlash {
+          0% { opacity: 0; }
+          18% { opacity: 0.22; }
+          100% { opacity: 0; }
+        }
+        @keyframes captureRing {
+          0% { opacity: 0.9; box-shadow: inset 0 0 0 2px rgba(37, 99, 235, 0.85); }
+          100% { opacity: 0; box-shadow: inset 0 0 0 2px rgba(37, 99, 235, 0); }
+        }
+      `}</style>
+
       <h2>Shopping Assistant</h2>
 
       {/* Camera: nearly full width (small side margins), split into two tap halves.
@@ -1086,6 +1106,38 @@ export default function VoiceClientPage() {
           muted
           style={{ display: "block", width: "100%", height: "auto" }}
         />
+
+        {/* Shutter flash + focus-ring pulse, fired at the exact moment of capture. */}
+        {captureFlashKey > 0 && (
+          <div
+            key={captureFlashKey}
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              inset: 0,
+              background: "#fff",
+              opacity: 0,
+              animation: "captureFlash 320ms ease-out",
+              pointerEvents: "none",
+              zIndex: 3,
+            }}
+          />
+        )}
+        {captureFlashKey > 0 && (
+          <div
+            key={`ring-${captureFlashKey}`}
+            aria-hidden="true"
+            style={{
+              position: "absolute",
+              inset: 0,
+              borderRadius: 12,
+              opacity: 0,
+              animation: "captureRing 420ms ease-out",
+              pointerEvents: "none",
+              zIndex: 3,
+            }}
+          />
+        )}
 
         {/* LEFT: stop */}
         <div
